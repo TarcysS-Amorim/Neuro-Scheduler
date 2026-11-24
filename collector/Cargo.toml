@@ -1,0 +1,21 @@
+[package]
+name = "ns-collector"
+version = "0.1.0"
+edition = "2021"
+license = "GPL-2.0"
+description = "Coletor de uso de processos, CPU, RAM e PSI do NeuroSched (fase 1: observa)"
+publish = false
+
+[[bin]]
+name = "ns-collector"
+path = "src/main.rs"
+
+[dependencies]
+procfs = { version = "0.18", default-features = false }
+rusqlite = { version = "0.43", features = ["bundled"] }
+
+[profile.release]
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true
