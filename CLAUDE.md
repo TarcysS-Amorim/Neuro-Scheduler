@@ -40,6 +40,6 @@ Fase atual: 1 (collector).
 - O collector precisa ser leve (meta: menos de 1% de CPU e 30 MB de RAM), porque mede o próprio sistema onde roda.
 - O collector só lê `/proc` e não roda como root.
 - Nunca commitar os bancos coletados (`*.db`), porque têm dados de uso pessoal.
-- Licença GPL-2.0, exigida pelos programas BPF do sched_ext.
+- Licença GPL-2.0, por escolha do projeto.
 - Commits no padrão Conventional Commits (`feat:`, `fix:`, `docs:`).
 - Rodar `cargo fmt` e `cargo clippy` antes de cada commit.

@@ -1,2 +1,2 @@
 # Neuro-Scheduler
-IA que aprende o uso diário e ajusta o scheduler e a paginação de RAM do Linux
+IA que aprende o uso diário e realoca processos do Linux, além da paginação de RAM. O kernel decide; o agente corrige depois.
