@@ -123,4 +123,4 @@ O banco tem dados de uso pessoal (quais programas você roda e quando).
 
 ## Fora de escopo
 
-Nada de modelo nem de scheduler aqui. Fase 1 só observa.
+Nada de modelo nem de allocator aqui. Fase 1 só observa.

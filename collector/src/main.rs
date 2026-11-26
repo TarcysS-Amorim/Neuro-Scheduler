@@ -4,6 +4,7 @@
 //! amostra em SQLite. Não altera nada no sistema e não precisa de root.
 
 mod db;
+mod focus;
 mod sampler;
 
 use std::path::PathBuf;

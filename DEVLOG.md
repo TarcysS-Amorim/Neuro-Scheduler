@@ -4,6 +4,23 @@ Registro das decisões do NeuroSched, mais recente primeiro. O que o `git log`
 já conta não se repete aqui; este arquivo guarda o **porquê** — sobretudo o das
 decisões que mudam o rumo do projeto e que ninguém recupera lendo o diff.
 
+## 2026-11-25
+
+### `scheduler/` virou `allocator/`, e `memory/` entrou nele
+
+A renomeação que a entrada de 24/11 deixou "para quando houver código lá dentro"
+foi feita antes disso, junto com a revisão do `CLAUDE.md`. O motivo é que o nome
+`scheduler/` continuava anunciando o oposto da regra do projeto: quem agenda é o
+kernel, e o diretório só aplica realocações depois. Manter o nome errado até
+existir código significava escrever esse código já contradizendo a pasta.
+
+`memory/` deixou de ser um diretório de topo e virou `allocator/memory/`. Os
+knobs de RAM (`memory.low`, `memory.high`, `memory.reclaim`) são mecanismos do
+mesmo agente que mexe em `cpu.weight` e cgroup, decididos pelos mesmos eventos e
+sujeitos à mesma histerese. Separá-los sugeria dois agentes onde há um só.
+
+Nenhum código foi tocado: os dois diretórios só tinham `README.md`.
+
 ## 2026-11-24
 
 ### Regra de arquitetura: o kernel decide, o agente corrige depois

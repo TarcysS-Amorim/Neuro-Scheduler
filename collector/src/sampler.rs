@@ -7,10 +7,23 @@ use std::time::Instant;
 
 use procfs::{Current, CurrentSI, LoadAverage, Meminfo};
 
+use crate::focus::{Focus, FocusInfo};
+
 /// Um processo só entra na amostra se usou CPU no intervalo ou se ocupa pelo
 /// menos este tanto de RSS. Sem esse filtro, cada ciclo gravaria as centenas de
 /// processos ociosos da máquina e o banco cresceria rápido demais.
 const MIN_RSS_BYTES: i64 = 32 * 1024 * 1024;
+
+/// Contadores de `/proc/vmstat` que viram delta por amostra. A ordem é a das
+/// colunas em [`VmstatDelta`]. A comparação é por chave exata, senão
+/// `pgscan_direct` casaria também com `pgscan_direct_throttle`.
+const VMSTAT_KEYS: [&str; 5] = [
+    "pgmajfault",
+    "pswpin",
+    "pswpout",
+    "pgscan_direct",
+    "pgsteal_direct",
+];
 
 /// Registro de pressão (PSI) de uma linha de `/proc/pressure/*`.
 #[derive(Debug, Clone, Copy)]
@@ -39,14 +52,46 @@ pub struct Pressure {
     pub full: Option<PressureLine>,
 }
 
+/// Deltas de `/proc/vmstat` no intervalo entre duas amostras.
+///
+/// Cada campo é `None` quando não havia leitura anterior (primeira amostra) ou
+/// quando o contador andou para trás, o que só acontece se o kernel zerá-lo.
+/// Guardar o delta, e não o acumulado, evita que o modelo precise diferenciar
+/// as linhas por conta própria.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct VmstatDelta {
+    pub pgmajfault: Option<i64>,
+    pub pswpin: Option<i64>,
+    pub pswpout: Option<i64>,
+    pub pgscan_direct: Option<i64>,
+    pub pgsteal_direct: Option<i64>,
+}
+
 /// Uso de um processo no intervalo entre duas amostras.
 #[derive(Debug)]
 pub struct ProcSample {
     pub pid: i32,
     pub name: String,
+    /// Início do processo em Unix epoch (segundos), derivado do `starttime` de
+    /// `/proc/PID/stat` somado ao boot. Em epoch, e não em ticks desde o boot,
+    /// o valor continua comparável depois de reiniciar a máquina; junto com o
+    /// `pid` é o que identifica o processo entre amostras.
+    pub start_time: i64,
     /// Percentual de um núcleo (pode passar de 100 em processos com threads).
     pub cpu_pct: f64,
     pub rss_bytes: i64,
+    /// Tempo de espera na runqueue **no intervalo**, de `/proc/PID/schedstat`.
+    ///
+    /// `None` só na primeira vez que o PID é visto (sem base anterior) ou se o
+    /// `schedstat` sumiu. O kernel conta aqui só a tarefa líder do grupo, não a
+    /// soma das threads: em apps muito paralelos o valor é um piso.
+    pub run_delay_ms: Option<f64>,
+    /// Major faults **no intervalo**, do `majflt` de `/proc/PID/stat`.
+    pub majflt: Option<i64>,
+    /// `VmSwap` de `/proc/PID/status`: quanto do processo está no swap agora.
+    pub swap_kb: Option<i64>,
+    /// Caminho do cgroup v2 (`/proc/PID/cgroup`).
+    pub cgroup: Option<String>,
 }
 
 /// Uma amostra completa do sistema.
@@ -67,6 +112,9 @@ pub struct Sample {
     pub swap_free_kb: i64,
     pub cpu_pressure: Pressure,
     pub mem_pressure: Pressure,
+    pub vmstat: VmstatDelta,
+    /// App em foco no momento da amostra, pelo IPC do compositor.
+    pub focus: FocusInfo,
     pub procs: Vec<ProcSample>,
 }
 
@@ -75,6 +123,11 @@ struct PrevProc {
     /// Usado para detectar reuso de PID.
     starttime: u64,
     cpu_ticks: u64,
+    majflt: u64,
+    /// Lido para todo processo visto no ciclo, ativo ou não, porque é a base
+    /// do delta do ciclo seguinte. `None` só quando o `schedstat` não pôde ser
+    /// lido (processo morreu no meio da varredura).
+    run_delay_ns: Option<u64>,
 }
 
 struct PrevCpu {
@@ -85,9 +138,13 @@ struct PrevCpu {
 pub struct Sampler {
     ticks_per_sec: f64,
     page_size: u64,
+    /// Unix epoch do boot, para converter o `starttime` dos processos.
+    boot_time_secs: i64,
     prev_procs: HashMap<i32, PrevProc>,
     prev_cpu: Option<PrevCpu>,
+    prev_vmstat: Option<[Option<u64>; 5]>,
     prev_at: Option<Instant>,
+    focus: Focus,
 }
 
 impl Sampler {
@@ -95,9 +152,12 @@ impl Sampler {
         Self {
             ticks_per_sec: procfs::ticks_per_second() as f64,
             page_size: procfs::page_size(),
+            boot_time_secs: procfs::boot_time_secs().unwrap_or(0) as i64,
             prev_procs: HashMap::new(),
             prev_cpu: None,
+            prev_vmstat: None,
             prev_at: None,
+            focus: Focus::new(),
         }
     }
 
@@ -113,6 +173,7 @@ impl Sampler {
         // `prev_at`: se alguma falhar, o relógio não avança e o próximo intervalo
         // cobre o período inteiro, mantendo os deltas de CPU coerentes.
         let cpu_pct = self.cpu_total_pct()?;
+        let vmstat = self.vmstat_delta();
         let procs = self.scan_processes(elapsed);
         self.prev_at = Some(now);
 
@@ -136,6 +197,8 @@ impl Sampler {
             swap_free_kb: (meminfo.swap_free / 1024) as i64,
             cpu_pressure: read_cpu_pressure(),
             mem_pressure: read_mem_pressure(),
+            vmstat,
+            focus: self.focus.current(),
             procs,
         }))
     }
@@ -163,6 +226,38 @@ impl Sampler {
         Ok(pct)
     }
 
+    /// Deltas dos contadores de `/proc/vmstat` desde a amostra anterior.
+    fn vmstat_delta(&mut self) -> VmstatDelta {
+        let cur = read_vmstat();
+
+        let delta = match (self.prev_vmstat.as_ref(), cur.as_ref()) {
+            (Some(prev), Some(cur)) => {
+                // Contador que andou para trás (kernel zerou) vira NULL em vez
+                // de um salto absurdo.
+                let d = |i: usize| {
+                    cur[i]
+                        .zip(prev[i])
+                        .and_then(|(c, p)| c.checked_sub(p))
+                        .map(|v| v as i64)
+                };
+                VmstatDelta {
+                    pgmajfault: d(0),
+                    pswpin: d(1),
+                    pswpout: d(2),
+                    pgscan_direct: d(3),
+                    pgsteal_direct: d(4),
+                }
+            }
+            _ => VmstatDelta::default(),
+        };
+
+        // Leitura falha não apaga a base: o próximo delta cobre o período todo.
+        if cur.is_some() {
+            self.prev_vmstat = cur;
+        }
+        delta
+    }
+
     /// Percorre `/proc/<pid>` e devolve os processos considerados ativos.
     fn scan_processes(&mut self, elapsed: Option<f64>) -> Vec<ProcSample> {
         let Ok(all) = procfs::process::all_processes() else {
@@ -184,32 +279,97 @@ impl Sampler {
                 .get(&pid)
                 .filter(|p| p.starttime == stat.starttime);
             let delta_ticks = prev.map_or(0, |p| cpu_ticks.saturating_sub(p.cpu_ticks));
+            let majflt = prev.and_then(|p| stat.majflt.checked_sub(p.majflt).map(|v| v as i64));
+            let prev_run_delay = prev.and_then(|p| p.run_delay_ns);
+
+            let active = delta_ticks > 0 || rss_bytes >= MIN_RSS_BYTES;
+
+            // O `schedstat` é lido para **todo** processo, inclusive os que não
+            // vão ser gravados. O valor é um acumulado desde o início do
+            // processo, então o delta exige a leitura do ciclo anterior: sem
+            // ler os ociosos, todo processo que alternava entre ativo e ocioso
+            // voltava sem base e gravava `run_delay_ms` nulo. Era 13,7% das
+            // linhas, concentrado justamente nos processos intermitentes.
+            //
+            // `status` e `cgroup` continuam só para os gravados: nenhum dos
+            // dois é delta, logo não precisam de base do ciclo anterior.
+            let run_delay_ns = proc.schedstat().ok().map(|s| s.run_delay);
 
             current.insert(
                 pid,
                 PrevProc {
                     starttime: stat.starttime,
                     cpu_ticks,
+                    majflt: stat.majflt,
+                    run_delay_ns,
                 },
             );
 
             // Na primeira amostra só aquecemos o estado; nada é gravado.
             let Some(elapsed) = elapsed else { continue };
-            if delta_ticks == 0 && rss_bytes < MIN_RSS_BYTES {
+            if !active {
                 continue;
             }
 
             out.push(ProcSample {
                 pid,
                 name: stat.comm,
+                start_time: self.boot_time_secs
+                    + (stat.starttime as f64 / self.ticks_per_sec) as i64,
                 cpu_pct: delta_ticks as f64 / self.ticks_per_sec / elapsed * 100.0,
                 rss_bytes,
+                run_delay_ms: run_delay_ns
+                    .zip(prev_run_delay)
+                    .and_then(|(cur, prev)| cur.checked_sub(prev))
+                    .map(|ns| ns as f64 / 1_000_000.0),
+                majflt,
+                swap_kb: read_swap_kb(pid),
+                cgroup: read_cgroup(pid),
             });
         }
 
         self.prev_procs = current;
         out
     }
+}
+
+/// Contadores de `/proc/vmstat` listados em [`VMSTAT_KEYS`], na mesma ordem.
+///
+/// O arquivo é lido à mão em vez de `procfs::vmstat()` porque aquela função
+/// devolve um `HashMap` com as ~200 linhas do arquivo; aqui só cinco importam.
+fn read_vmstat() -> Option<[Option<u64>; 5]> {
+    let text = std::fs::read_to_string("/proc/vmstat").ok()?;
+    let mut out = [None; 5];
+    for line in text.lines() {
+        let Some((key, value)) = line.split_once(' ') else {
+            continue;
+        };
+        if let Some(i) = VMSTAT_KEYS.iter().position(|k| *k == key) {
+            out[i] = value.trim().parse().ok();
+        }
+    }
+    Some(out)
+}
+
+/// `VmSwap` de `/proc/<pid>/status`, em KiB.
+///
+/// Só essa linha interessa, então o arquivo é varrido à mão: `Process::status()`
+/// montaria um `HashMap` e um struct com dezenas de `String` por processo.
+fn read_swap_kb(pid: i32) -> Option<i64> {
+    let text = std::fs::read_to_string(format!("/proc/{pid}/status")).ok()?;
+    text.lines()
+        .find_map(|l| l.strip_prefix("VmSwap:"))
+        .and_then(|v| v.split_whitespace().next())
+        .and_then(|v| v.parse().ok())
+}
+
+/// Caminho do cgroup v2 de `/proc/<pid>/cgroup`, a linha `0::<caminho>`.
+fn read_cgroup(pid: i32) -> Option<String> {
+    let text = std::fs::read_to_string(format!("/proc/{pid}/cgroup")).ok()?;
+    text.lines()
+        .find_map(|l| l.strip_prefix("0::"))
+        .map(|p| p.trim().to_string())
+        .filter(|p| !p.is_empty())
 }
 
 fn read_cpu_pressure() -> Pressure {
